@@ -78,122 +78,388 @@ The ping failed because each switch is programmed
 according to `basic.p4`, which drops all packets on arrival.
 Your job is to extend this file so it forwards packets.
 
-### A note about the control plane
+[comment]: # "SPDX-License-Identifier:  Apache-2.0"
 
-A P4 program defines a packet-processing pipeline, but the rules
-within each table are inserted by the control plane. When a rule
-matches a packet, its action is invoked with parameters supplied by
-the control plane as part of the rule.
+# Hop-by-hop IPv4 Privacy in P4
 
-In this exercise, we have already implemented the control plane
-logic for you. As part of bringing up the Mininet instance, the
-`make run` command will install packet-processing rules in the tables of
-each switch. These are defined in the `sX-runtime.json` files, where
-`X` corresponds to the switch number.
+## Overview
 
-**Important:** We use P4Runtime to install the control plane rules. The
-content of files `sX-runtime.json` refer to specific names of tables, keys, and
-actions, as defined in the P4Info file produced by the compiler (look for the
-file `build/basic.p4.p4info.txtpb` after executing `make run`). Any changes in the P4
-program that add or rename tables, keys, or actions will need to be reflected in
-these `sX-runtime.json` files.
+This project implements the hop-by-hop IPv4 privacy scheme described in the **"P4 and Privacy"** report. The data plane is written in P4_16 for the v1model architecture and runs on the BMv2 `simple_switch` target inside Mininet.
 
-## Step 2: Implement L3 forwarding
+At a high level:
 
-The `basic.p4` file contains a skeleton P4 program with key pieces of
-logic replaced by `TODO` comments. Your implementation should follow
-the structure given in this file---replace each `TODO` with logic
-implementing the missing piece.
+* The **edge switches** (`s1`, `s2`) act as privacy-capable PGB routers.
+* The **core switches** (`s3`, `s4`) forward packets using plain IPv4 longest-prefix matching and remain **stateless** with respect to flows.
+* For selected TCP flows between the client (`h1`) and server (`h4`), the edge switch:
 
-A complete `basic.p4` will contain the following components:
+  * Derives a per-packet nonce from the destination address, destination port, and ingress timestamp.
+  * Uses a simple keyed construction to generate a pad.
+  * XORs the pad with the IPv4 source address and TCP source port.
+  * Stores the nonce in a custom `privacy_t` header and changes the IPv4 protocol field.
+* On the return path, the opposite edge switch reverses the transformation using the stored nonce and restores the original IPv4/TCP header fields.
 
-1. Header type definitions for Ethernet (`ethernet_t`) and IPv4 (`ipv4_t`).
-2. **TODO:** Parsers for Ethernet and IPv4 that populate `ethernet_t` and `ipv4_t` fields.
-3. An action to drop a packet, using `mark_to_drop()`.
-4. **TODO:** An action (called `ipv4_forward`) that:
-	1. Sets the egress port for the next hop.
-	2. Updates the ethernet destination address with the address of the next hop.
-	3. Updates the ethernet source address with the address of the switch.
-	4. Decrements the TTL.
-5. **TODO:** A control that:
-    1. Defines a table that will read an IPv4 destination address, and
-       invoke either `drop` or `ipv4_forward`.
-    2. An `apply` block that applies the table.
-6. **TODO:** A deparser that selects the order
-    in which fields inserted into the outgoing packet.
-7. A `package` instantiation supplied with the parser, control, and deparser.
-    > In general, a package also requires instances of checksum verification
-    > and recomputation controls. These are not necessary for this tutorial
-    > and are replaced with instantiations of empty controls.
+This README explains how to:
 
-## Step 3: Run your solution
+1. Build and run the Mininet topology.
+2. Verify that the P4 pipeline works as expected.
+3. Reproduce the **privacy** and **performance** metrics from the report.
+4. Edit this README and the P4 code inside the VM.
 
-Follow the instructions from Step 1. This time, you should be able to
-sucessfully ping between any two hosts in the topology.
+## Repository Layout
 
-### Food for thought
+Key files and directories (names may vary slightly depending on how you cloned/copied the exercise):
 
-The "test suite" for your solution---sending pings between hosts in the
-topology---is not very robust. What else should you test to be confident
-that you implementation is correct?
+* `Makefile`
+  Orchestrates compilation of the P4 program, starts Mininet, and configures switches.
+* `*.p4`
+  The main P4 program referenced by `P4SRC` in the `Makefile` (e.g., `basic.p4`, `privacy_hophop.p4`, etc.). This file contains:
 
-> Although the Python `scapy` library is outside the scope of this tutorial,
-> it can be used to generate packets for testing. The `send.py` file shows how
-> to use it.
+  * Header definitions (`ethernet_t`, `ipv4_t`, `tcp_t`, `privacy_t`).
+  * Parser and deparser.
+  * `MyIngress` control with `ipv4_lpm` and `privacy_policy` tables.
+* `pcaps/`
+  Optional directory where you can store packet captures (ignored by Git if `.gitignore` is configured as suggested).
+* `logs/`
+  BMv2 log files produced while the topology runs. Helpful for debugging.
+* `sX-runtime.json`
+  P4Runtime control-plane configuration files used by the `Makefile` to populate switch tables.
 
-Other questions to consider:
- - How would you enhance your program to respond to ARP requests?
- - How would you enhance your program to support traceroute?
- - How would you enhance your program to support next hops?
- - Is this program enough to replace a router?  What's missing?
+If you rename the P4 file, make sure to update the `P4SRC` variable in the `Makefile` so that `make run` compiles the correct source.
 
-### Troubleshooting
+## Prerequisites
 
-There are several problems that might manifest as you develop your program:
+The project assumes you are using the standard P4 tutorials VM or an equivalent environment with:
 
-1. `basic.p4` might fail to compile. In this case, `make run` will
-report the error emitted from the compiler and halt.
+* `p4c` (P4_16 compiler)
+* BMv2 `simple_switch` target
+* Mininet
+* Python 3
+* `iperf3`
+* `tcpdump`
 
-2. `basic.p4` might compile but fail to support the control plane
-rules in the `s1-runtime.json` through `s3-runtime.json` files that
-`make run` tries to install using P4Runtime. In this case, `make run` will
-report errors if control plane rules cannot be installed. Use these error
-messages to fix your `basic.p4` implementation.
+If you are using the official P4 tutorials VM, all of these are already installed.
 
-3. `basic.p4` might compile, and the control plane rules might be
-installed, but the switch might not process packets in the desired
-way. The `logs/sX.log` files contain detailed logs
-that describing how each switch processes each packet. The output is
-detailed and can help pinpoint logic errors in your implementation.
+## 1. Running the Topology
 
-#### Cleaning up Mininet
-
-In the latter two cases above, `make run` may leave a Mininet instance
-running in the background. Use the following command to clean up
-these instances:
+From inside the project directory (e.g., `~/tutorials/exercises/privacy_hophop`):
 
 ```bash
-make stop
+make run
 ```
 
-## The Use of Gateway (gw) and ARP Commands in `topology.json`
-- Gateway (gw) Command: The `route add default gw` command is used to set the default gateway for a host. This tells the host which IP address to send packets to if the destination IP is not on the same subnet. It's important for hosts to know their default gateway to communicate with devices outside their local network.
-- ARP Command: The `arp -i eth0 -s` command is used to add static ARP entries to the host's ARP cache. When you add static ARP entries, you're telling your computer something like i.e. "Hey, I already know who lives at this IP address (like 10.0.0.1), so you don't need to keep asking everyone on the network 'Who has this IP?' all the time." This is particularly important in this exercise (and most of the other exercises) since the switches do not respond to ARP requests. In real networks, production switches typically do respond to ARP requests, but in these exercises, static ARP entries are necessary for the gateway router due to this behavior.
-  - `-i eth0`: This specifies the network interface (e.g. eth0) on which you want to perform the ARP operation.
-  - `-s`: This flag is used to set a static ARP entry.
+This will:
 
-*Note*: If you remove the gateway and ARP commands, the hosts in your network might lose connectivity to each other and to devices outside their local subnet. This can result in 100% packet loss when running the `pingall` command because the hosts don't have the necessary routing information and ARP entries to reach their destinations.
+1. Compile the P4 program specified in the `Makefile`.
+2. Start the Mininet topology with four P4 switches (`s1`–`s4`) and two hosts (`h1` and `h4`).
+3. Configure each switch with its P4 program and table entries using P4Runtime.
+4. Configure host IPs, routes, and ARP entries from `topology.json`.
 
-## Next Steps
+After a successful start you should see a Mininet prompt:
 
-Congratulations, your implementation works! Move onto the next assignment
-[Basic Tunneling](../basic_tunnel)
+```text
+mininet>
+```
 
+To clean up when you are done:
 
-## Relevant Documentation
+```bash
+# Stop Mininet and kill switches
+make stop
 
-The documentation for P4_16 and P4Runtime is available [here](https://p4.org/specs/)
+# Optionally remove build artifacts, pcaps, and logs
+make clean
+```
 
-All excercises in this repository use the v1model architecture, the documentation for which is available at:
-1. The BMv2 Simple Switch target document accessible [here](https://github.com/p4lang/behavioral-model/blob/master/docs/simple_switch.md) talks mainly about the v1model architecture.
-2. The include file `v1model.p4` has extensive comments and can be accessed [here](https://github.com/p4lang/p4c/blob/master/p4include/v1model.p4).
+## 2. Basic Sanity Tests
+
+From the `mininet>` prompt:
+
+### 2.1 Check connectivity
+
+```bash
+mininet> h1 ping -c 3 h4
+```
+
+If privacy is enabled correctly, the ping should succeed and the data plane should:
+
+* Rewrite and encrypt the `(src IP, src port)` on the **client-to-server** direction at the edge.
+* Decrypt and restore the original values at the opposite edge.
+
+### 2.2 TCP flow with iperf3
+
+Still at the `mininet>` prompt:
+
+```bash
+mininet> h4 iperf3 -s &
+mininet> h1 iperf3 -c 10.0.4.4 -t 20
+```
+
+* `h4` runs an `iperf3` server.
+* `h1` sends a 20-second TCP flow to `h4`.
+* The reported average throughput will be used for performance metrics.
+
+When finished, stop the `iperf3` server on `h4` with `Ctrl+C` in its xterm (if opened) or kill the process from Mininet.
+
+## 3. Measuring Privacy Metrics
+
+The report evaluates three main privacy metrics:
+
+* **Pseudonym churn** `C_IDS`
+* **IP-based linkability** `L_IP`
+* **Entropy of identifiers** `H(S_core)`
+
+All of these are computed from packet traces captured at two vantage points on `s1`:
+
+1. **Edge view** – interface towards `h1` (real client address visible).
+2. **Core view** – interface towards the core (`s3`) where identifiers are encrypted.
+
+### 3.1 Capture traces
+
+From the `mininet>` prompt, open xterms for `s1` and `h1` / `h4` if needed:
+
+```bash
+mininet> xterm s1 h1 h4
+```
+
+In the `s1` xterm:
+
+```bash
+mkdir -p pcaps
+
+# Client-edge view (towards h1)
+tcpdump -i s1-eth1 -n -w pcaps/s1-eth1_in.pcap &
+
+# Core-facing view (towards s3)
+tcpdump -i s1-eth4 -n -w pcaps/s1-eth4_out.pcap &
+```
+
+Then, in the `h4` and `h1` xterms, start the `iperf3` experiment:
+
+```bash
+# On h4
+iperf3 -s
+
+# On h1
+iperf3 -c 10.0.4.4 -t 20
+```
+
+After `iperf3` finishes, stop the `tcpdump` processes on `s1` with `Ctrl+C` in the `s1` xterm.
+
+You now have two pcaps:
+
+* `pcaps/s1-eth1_in.pcap` – edge view
+* `pcaps/s1-eth4_out.pcap` – core (encrypted) view
+
+### 3.2 Pseudonym churn `C_IDS`
+
+Pseudonyms are defined as `(IP_src, Port_src)` pairs observed at the core.
+
+On the VM shell (inside the project directory):
+
+```bash
+cd ~/tutorials/exercises/privacy_hophop
+
+# Count distinct (IP.src,port.src) strings in the core view
+tcpdump -nnr pcaps/s1-eth4_out.pcap 'tcp' \
+  | awk '/IP/ {print $3}' \
+  | sed 's/.$//' \
+  | sort | uniq > core_ids.txt
+
+N_IDS=$(wc -l < core_ids.txt)
+echo "N_IDS = $N_IDS"
+```
+
+If the flow lasted `T` seconds (e.g., `T = 20`), the churn rate is:
+
+```bash
+C_IDS = N_IDS / T
+```
+
+You can compute it directly:
+
+```bash
+python3 - << EOF
+N = $N_IDS
+T = 20.0
+print(f"C_IDS = {N/T:.1f} IDs/s")
+EOF
+```
+
+### 3.3 IP-based linkability `L_IP`
+
+We compare the **set of source IPs** at the edge and at the core.
+
+```bash
+# Edge-side source IPs
+tcpdump -nnr pcaps/s1-eth1_in.pcap 'tcp' \
+  | awk '/IP/ {print $3}' \
+  | sed 's/\.[0-9]*$//' \
+  | sort -u > edge_ips.txt
+
+# Core-side source IPs
+tcpdump -nnr pcaps/s1-eth4_out.pcap 'tcp' \
+  | awk '/IP/ {print $3}' \
+  | sed 's/\.[0-9]*$//' \
+  | sort -u > core_ips.txt
+
+# Intersection size
+INTERSECT=$(comm -12 edge_ips.txt core_ips.txt | wc -l)
+EDGE_SIZE=$(wc -l < edge_ips.txt)
+
+echo "|S_edge ∩ S_core| = $INTERSECT"
+echo "|S_edge| = $EDGE_SIZE"
+
+python3 - << EOF
+I = $INTERSECT
+E = $EDGE_SIZE
+if E == 0:
+    print("L_IP undefined (no edge sources)")
+else:
+    print(f"L_IP = {I / E:.3f}")
+EOF
+```
+
+In the privacy-enabled configuration you should observe `L_IP ≈ 0`, because the client’s real IP (e.g., `10.0.1.1`) never appears at the core.
+
+### 3.4 Entropy of identifiers `H(S_core)`
+
+First, compute the frequency of each pseudonym in the core view:
+
+```bash
+# core_ids.txt already contains all distinct identifiers; now get counts
+tcpdump -nnr pcaps/s1-eth4_out.pcap 'tcp' \
+  | awk '/IP/ {print $3}' \
+  | sed 's/.$//' \
+  | sort | uniq -c > core_ids_counts.txt
+```
+
+Then feed the counts into a small Python snippet to compute Shannon entropy:
+
+```bash
+python3 - << 'EOF'
+import math
+import sys
+
+counts = []
+with open('core_ids_counts.txt') as f:
+    for line in f:
+        parts = line.strip().split()
+        if not parts:
+            continue
+        c = int(parts[0])
+        counts.append(c)
+
+N = sum(counts)
+if N == 0:
+    print("No packets found in core_ids_counts.txt")
+    sys.exit(0)
+
+H = 0.0
+for c in counts:
+    p = c / N
+    H -= p * math.log2(p)
+
+print(f"H(S_core) = {H:.2f} bits")
+EOF
+```
+
+For a single stable identifier you should see `H ≈ 0`. With privacy enabled you should see entropy close to `log2(N_IDS)`.
+
+## 4. Measuring Performance (Throughput & RTT)
+
+We measure performance using:
+
+* Average RTT from 50 ICMP echo requests (`ping`).
+* Average TCP throughput from a 10-second `iperf3` run.
+
+### 4.1 Baseline IPv4 (no privacy)
+
+To obtain baseline values, temporarily **disable the privacy logic**. One simple way is to comment out the call to `privacy_policy.apply()` in the `MyIngress.apply` block:
+
+```p4
+apply {
+    if (hdr.ipv4.isValid()) {
+        if (hdr.tcp.isValid()) {
+            // Temporarily disable privacy for baseline
+            // privacy_policy.apply();
+        }
+        ipv4_lpm.apply();
+    }
+}
+```
+
+Recompile and start Mininet:
+
+```bash
+make clean
+make run
+```
+
+From `mininet>`:
+
+```bash
+# RTT baseline
+mininet> h1 ping -c 50 h4
+
+# Throughput baseline
+mininet> h4 iperf3 -s &
+mininet> h1 iperf3 -c 10.0.4.4 -t 10
+```
+
+Record:
+
+* `R_b` – average RTT (from the last line of `ping`).
+* `T_b` – average throughput (from `iperf3` sender summary).
+
+### 4.2 Privacy-enabled configuration
+
+Re-enable the call to `privacy_policy.apply()` in `MyIngress.apply`, recompile, and run again:
+
+```bash
+make clean
+make run
+```
+
+Then from `mininet>`:
+
+```bash
+# RTT with privacy
+mininet> h1 ping -c 50 h4
+
+# Throughput with privacy
+mininet> h4 iperf3 -s &
+mininet> h1 iperf3 -c 10.0.4.4 -t 10
+```
+
+Record:
+
+* `R_p` – RTT with privacy.
+* `T_p` – throughput with privacy.
+
+### 4.3 Computing the overhead
+
+Using the values above:
+
+* Absolute RTT increase:
+
+  ```text
+  ΔR = R_p − R_b
+  ```
+
+* Relative RTT increase:
+
+  ```text
+  Rel_R = ΔR / R_b
+  ```
+
+* Throughput overhead:
+
+  ```text
+  Overhead_T = 1 − T_p / T_b
+  ```
+
+Example (numbers from the report):
+
+* `R_b = 9.9 ms`, `R_p = 10.9 ms` → `ΔR = 1.0 ms`, `Rel_R ≈ 10%`
+* `T_b = 14.3 Mbit/s`, `T_p = 11.9 Mbit/s` → `Overhead_T ≈ 16.8%`
+
